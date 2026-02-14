@@ -1,6 +1,6 @@
-# Attempted to adapt pyWinVirtualDesktop https://github.com/kdschlosser/pyWinVirtualDesktop
-# Local functioning build, but still issues with portability and ease of use
-# So instead using built-in Virtual Desktop detection via DWM cloaking with pywin32
+# Trying to get pyWinVirtualDesktop working: https://claude.ai/chat/7aa5f9ea-3bf2-4fff-8ccd-df85afad0ffd
+# Final fixes: https://claude.ai/chat/b7bdf45d-c14d-4dcd-8add-2afd69c14fe2
+# Updated to support native files (.ahk, .exe, .bat, etc.) in addition to .lnk shortcuts
 
 from __future__ import print_function
 import os
@@ -22,6 +22,9 @@ except ImportError:
 
 # DWM constants for virtual desktop detection
 DWMWA_CLOAKED = 14
+
+# Define supported executable extensions
+EXECUTABLE_EXTENSIONS = {'.exe', '.bat', '.cmd', '.ahk', '.ps1', '.vbs', '.com'}
 
 class WindowInfo:
     """Simple container for window information"""
@@ -189,13 +192,25 @@ restricted_programs = set()
 def parse_arguments():
     """Parse command line arguments"""
     parser = argparse.ArgumentParser(
-        description='Desktop Startup Script - Launch shortcuts with duplicate control',
+        description='Desktop Startup Script - Launch shortcuts and executables with duplicate control',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   %(prog)s
-    # Default: Allow multiple instances of all programs
+    # Default: Allow multiple instances, include both .lnk and native files
     
+  %(prog)s --no-native
+    # Only process .lnk shortcuts, skip native executables
+    
+  %(prog)s --native-only
+    # Only run native files (.exe, .ahk, .bat, etc.), skip .lnk shortcuts
+
+  %(prog)s --native-types .ahk
+    # Process .lnk shortcuts + only .ahk native files (skip .ps1, .bat, etc.)
+
+  %(prog)s --native-types .ahk .exe
+    # Process .lnk shortcuts + only .ahk and .exe native files
+
   %(prog)s --restrict-multiple firefox chrome
     # Restrict Firefox and Chrome to single instance
     
@@ -227,6 +242,21 @@ Examples:
     parser.add_argument('-am', '--allow-multiple', action='append',
                         dest='allow_list', metavar='PROGRAM',
                         help='Allow multiple instances of specific program (only useful with --restrict-all)')
+    
+    # Native file handling
+    parser.add_argument('--include-native', action='store_true',
+                        help='Include native executable files in addition to .lnk shortcuts (this is the DEFAULT behavior)')
+    
+    parser.add_argument('--no-native', action='store_true',
+                        help='Exclude native executable files, only process .lnk shortcuts')
+    
+    parser.add_argument('--native-only', action='store_true',
+                        help='Only process native executable files, skip .lnk shortcuts')
+
+    parser.add_argument('--native-types', nargs='+', metavar='EXT',
+                        help='Only include these native file types (e.g., --native-types .ahk .exe). '
+                             'When specified, only native files matching these extensions are processed. '
+                             'Dot prefix is optional (both "ahk" and ".ahk" work).')
     
     # Other options
     parser.add_argument('-v', '--verbose', action='store_true',
@@ -264,10 +294,72 @@ Examples:
     else:
         args.allowed_programs = None
     
+    # Handle native file inclusion
+    # Simple: Default to True, only False if --no-native is used
+    args.include_native = not args.no_native
+
+    # Normalize --native-types extensions (ensure dot prefix, lowercase)
+    if args.native_types:
+        args.native_types = {
+            ext.lower() if ext.startswith('.') else f'.{ext.lower()}'
+            for ext in args.native_types
+        }
+
     return args
+
+def is_native_executable(filename):
+    """Check if a file is a native executable"""
+    # Make sure we're dealing with a file, not a directory
+    if os.path.isdir(filename):
+        return False
+    
+    # Get extension and normalize to lowercase
+    ext = os.path.splitext(filename)[1].lower()
+    
+    # Strip any whitespace that might be present
+    ext = ext.strip()
+    
+    return ext in EXECUTABLE_EXTENSIONS
+
+def get_target_info(filename, args):
+    """Get target information for either .lnk or native files"""
+    basename = os.path.splitext(filename)[0].lower()
+    
+    if filename.endswith('.lnk'):
+        if not shell:
+            # Can't parse shortcuts without win32com
+            if args.verbose:
+                print(f"  Warning: Cannot parse shortcut '{filename}' - pywin32 not installed")
+            return None, None, None
+        
+        try:
+            shortcut_obj = shell.CreateShortCut(filename)
+            targetname = os.path.basename(shortcut_obj.Targetpath.lower())
+            targetname_noext = os.path.splitext(targetname)[0]
+            arguments = shortcut_obj.Arguments
+            return targetname, targetname_noext, arguments
+        except Exception as e:
+            # Shortcut parsing failed
+            print(f"  Error: Failed to parse shortcut '{filename}': {e}")
+            return None, None, None
+    
+    # For native files
+    if is_native_executable(filename):
+        targetname = filename.lower()
+        targetname_noext = basename
+        arguments = ""
+        return targetname, targetname_noext, arguments
+    
+    # Unknown file type (shouldn't happen with current filtering)
+    return None, None, None
 
 def should_allow_multiple(filename, shortcut_targetname, args):
     """Determine if multiple instances should be allowed for this program"""
+    
+    # Handle case where we couldn't determine the target
+    if shortcut_targetname is None:
+        # Default to the global setting when we can't parse the file
+        return allow_multiple_default
     
     # Extract the base name without extension
     target_base = shortcut_targetname.lower()
@@ -300,12 +392,11 @@ def should_allow_multiple(filename, shortcut_targetname, args):
     # Default behavior
     return allow_multiple_default
 
-def IsShortcutAlreadyRunning(filename, args):
-    """Check if a shortcut's target is already running"""
-    shortcut_basename = os.path.splitext(filename)[0].lower()
+def IsFileAlreadyRunning(filename, args):
+    """Check if a file's target is already running (works for both .lnk and native files)"""
+    basename = os.path.splitext(filename)[0].lower()
     
-    # Special handling for already launched shortcuts in this session
-    # This allows multiple instances of the same program with different shortcuts
+    # Special handling for already launched files in this session
     if filename.lower() in launched_shortcuts:
         return True
     
@@ -317,38 +408,31 @@ def IsShortcutAlreadyRunning(filename, args):
             print("Using fallback process detection...")
         desktop = FallbackDesktop()
     
-    # Check if we have win32com for proper shortcut parsing
-    if shell:
-        try:
-            shortcut_obj = shell.CreateShortCut(filename)
-            shortcut_targetname = os.path.basename(shortcut_obj.Targetpath.lower())
-            shortcut_targetname_noext = os.path.splitext(shortcut_targetname)[0]
-            shortcut_arguments = shortcut_obj.Arguments
-        except:
-            shortcut_targetname = shortcut_basename + ".exe"
-            shortcut_targetname_noext = shortcut_basename
-            shortcut_arguments = ""
-    else:
-        shortcut_targetname = shortcut_basename + ".exe"
-        shortcut_targetname_noext = shortcut_basename
-        shortcut_arguments = ""
+    # Get target information
+    targetname, targetname_noext, arguments = get_target_info(filename, args)
+    
+    # If we couldn't parse the file, we can't check if it's running
+    if targetname is None:
+        if args.verbose:
+            print(f"  Cannot check if '{filename}' is running - unable to parse file")
+        return False
     
     # Check if multiple instances are allowed for this program
-    allow_multiple = should_allow_multiple(filename, shortcut_targetname, args)
+    allow_multiple = should_allow_multiple(filename, targetname, args)
     
     if args.verbose:
         print(f"  Multiple instances allowed: {allow_multiple}")
     
-    # If multiple processes are allowed, check for exact shortcut name match
+    # If multiple processes are allowed, check for exact name match
     if allow_multiple:
-        # Only check if this specific shortcut variant is running
+        # Only check if this specific variant is running
         for window in desktop:
             if window.is_on_active_desktop:
                 window_title = window.text.lower()
-                # Check if the window title contains the shortcut's unique identifier
-                if shortcut_basename in window_title:
+                # Check if the window title contains the file's unique identifier
+                if basename in window_title:
                     if args.verbose:
-                        print(f"  Found matching window for {shortcut_basename}: {window.text}")
+                        print(f"  Found matching window for {basename}: {window.text}")
                     return True
         return False
     
@@ -361,14 +445,117 @@ def IsShortcutAlreadyRunning(filename, args):
             if process_name.endswith('.exe'):
                 process_name = process_name[:-4]
             
-            if (shortcut_basename in process_name or 
-               shortcut_basename in shortcut_arguments or
-               shortcut_targetname_noext in process_name):
-                if args.verbose:
-                    print(f"  Found matching process: {window.process_name}")
-                return True
+            # For AHK files, check for AutoHotkey.exe
+            if filename.endswith('.ahk'):
+                if 'autohotkey' in process_name:
+                    # Check window title for script name
+                    # AutoHotkey typically includes the script name in the window title
+                    window_title = window.text.lower()
+                    
+                    # Check if this specific script is running
+                    # Look for the script filename in the window title
+                    if basename in window_title or filename.lower() in window_title:
+                        if args.verbose:
+                            print(f"  Found matching AHK script: {window.text}")
+                        return True
+                    
+                    # Also check if the process command line contains our script
+                    # (This would require more advanced process inspection)
+                    # For now, we'll be conservative and not match generic AutoHotkey processes
+                    
+                # Also check if there's a window with the script name
+                # (Some AHK scripts create their own windows)
+                elif basename in window.text.lower():
+                    if args.verbose:
+                        print(f"  Found window potentially from AHK script: {window.text}")
+                    return True
+            else:
+                if (basename in process_name or 
+                   basename in arguments or
+                   targetname_noext in process_name):
+                    if args.verbose:
+                        print(f"  Found matching process: {window.process_name}")
+                    return True
     
     return False
+
+def launch_file(filename, args):
+    """Launch either a .lnk shortcut or a native executable"""
+    if filename.endswith('.lnk'):
+        # Launch shortcut via explorer
+        arguments = ['explorer.exe', filename]
+    elif is_native_executable(filename):
+        # Launch native file directly
+        ext = os.path.splitext(filename)[1].lower()
+        
+        if ext == '.ahk':
+            # AutoHotkey files - try multiple approaches
+            # First, try to find AutoHotkey in common locations
+            ahk_paths = [
+                'AutoHotkey.exe',  # In PATH
+                'AutoHotkeyU64.exe',  # v1 64-bit
+                'AutoHotkeyU32.exe',  # v1 32-bit
+                'AutoHotkey32.exe',  # v2 32-bit
+                'AutoHotkey64.exe',  # v2 64-bit
+                r'C:\Program Files\AutoHotkey\AutoHotkey.exe',
+                r'C:\Program Files\AutoHotkey\v2\AutoHotkey.exe',
+                r'C:\Program Files\AutoHotkey\v2\AutoHotkey64.exe',
+                r'C:\Program Files\AutoHotkey\v1.1\AutoHotkeyU64.exe',
+                r'C:\Program Files (x86)\AutoHotkey\AutoHotkey.exe',
+            ]
+            
+            # Try each potential AutoHotkey executable
+            ahk_found = False
+            for ahk_exe in ahk_paths:
+                try:
+                    # Test if this AutoHotkey executable exists/works
+                    arguments = [ahk_exe, filename]
+                    proc = subprocess.Popen(arguments, shell=False, stdin=None,
+                                          stdout=None, stderr=None, close_fds=True)
+                    ahk_found = True
+                    if args.verbose:
+                        print(f"  Using AutoHotkey: {ahk_exe}")
+                    return True
+                except (FileNotFoundError, OSError):
+                    continue
+            
+            if not ahk_found:
+                # Last resort: try to launch .ahk directly (relies on Windows file association)
+                try:
+                    arguments = ['cmd.exe', '/c', 'start', '""', filename]
+                    proc = subprocess.Popen(arguments, shell=False, stdin=None,
+                                          stdout=None, stderr=None, close_fds=True)
+                    if args.verbose:
+                        print(f"  Launching via Windows file association")
+                    return True
+                except Exception as e:
+                    print(f"  ✗ Error: AutoHotkey not found. Please install AutoHotkey or check PATH")
+                    print(f"     Tried locations: {', '.join(ahk_paths[:5])}...")
+                    return False
+            
+        elif ext in {'.bat', '.cmd'}:
+            # Batch files - run via cmd
+            arguments = ['cmd.exe', '/c', 'start', '""', filename]
+        elif ext == '.ps1':
+            # PowerShell scripts
+            arguments = ['powershell.exe', '-ExecutionPolicy', 'Bypass', '-File', filename]
+        elif ext == '.vbs':
+            # VBScript files
+            arguments = ['wscript.exe', filename]
+        else:
+            # .exe, .com, and others - run directly
+            arguments = [filename]
+    else:
+        # Unknown file type
+        return False
+    
+    try:
+        proc = subprocess.Popen(arguments, shell=False, stdin=None, 
+                              stdout=None, stderr=None, close_fds=True)
+        return True
+    except Exception as e:
+        print(f"  ✗ Error launching {filename}: {e}")
+        return False
 
 def main():
     """Main execution"""
@@ -376,6 +563,7 @@ def main():
     args = parse_arguments()
     
     print("Desktop Startup Script - Windows 11 Compatible Version")
+    print("(Now with native file support!)")
     print("=" * 50)
     
     # IMPORTANT: Use the current working directory (where the shortcut was launched)
@@ -399,12 +587,15 @@ def main():
     # If startup_dir doesn't exist, try just using the current directory
     if not os.path.exists(startup_dir):
         print(f"Desktop-Startup not found at: {startup_dir}")
-        print(f"Checking current directory for .lnk files...")
+        print(f"Checking current directory for startup files...")
         
-        # Check if current directory has .lnk files
-        lnk_files = [f for f in os.listdir(initial_cwd) if f.endswith('.lnk')]
-        if lnk_files:
-            print(f"Found {len(lnk_files)} .lnk files in current directory")
+        # Check if current directory has relevant files
+        all_files = os.listdir(initial_cwd)
+        lnk_files = [f for f in all_files if f.endswith('.lnk')]
+        native_files = [f for f in all_files if is_native_executable(f)]
+        
+        if lnk_files or native_files:
+            print(f"Found {len(lnk_files)} .lnk files and {len(native_files)} native executables")
             startup_dir = initial_cwd
         else:
             # Try creating Desktop-Startup folder
@@ -422,77 +613,164 @@ def main():
         print(f"  Restricted programs: {', '.join(sorted(restricted_programs))}")
     if args.restrict_all and args.allowed_programs:
         print(f"  Allowed programs: {', '.join(sorted(args.allowed_programs))}")
+    print(f"  Include native files: {args.include_native}")
+    if args.native_types:
+        print(f"  Native types filter: {', '.join(sorted(args.native_types))}")
+    print(f"  Native only: {args.native_only if hasattr(args, 'native_only') else False}")
     print(f"  Launch delay: {args.delay} seconds")
     print(f"  Max wait time: {args.wait_time} seconds")
+    if args.verbose:
+        print(f"  Recognized native extensions: {', '.join(sorted(EXECUTABLE_EXTENSIONS))}")
     
-    # Process shortcuts
-    shortcuts = [f for f in os.listdir('.') if f.endswith('.lnk')]
+    # Collect files to process
+    all_files = []
     
-    if not shortcuts:
-        print("\nNo .lnk files found")
+    # Debug: Show all files in directory first
+    if args.verbose:
+        print(f"\n=== Directory Contents ===")
+        try:
+            all_items = os.listdir('.')
+            print(f"Total items in directory: {len(all_items)}")
+            for item in sorted(all_items):
+                full_path = os.path.join('.', item)
+                if os.path.isdir(full_path):
+                    print(f"  [DIR]  {item}")
+                else:
+                    size = os.path.getsize(full_path)
+                    print(f"  [FILE] {item} ({size} bytes)")
+        except Exception as e:
+            print(f"Error listing directory: {e}")
+        print("=" * 30)
+    
+    if not args.native_only:
+        # Add .lnk files
+        shortcuts = [f for f in os.listdir('.') if f.endswith('.lnk')]
+        all_files.extend(shortcuts)
+        print(f"\nFound {len(shortcuts)} .lnk shortcuts")
+        if args.verbose and shortcuts:
+            print(f"  Shortcuts: {', '.join(sorted(shortcuts))}")
+    
+    if args.include_native:
+        # Add native executable files
+        native_files = [f for f in os.listdir('.') if is_native_executable(f)]
+        # Apply --native-types filter if specified
+        if args.native_types:
+            skipped = [f for f in native_files if os.path.splitext(f)[1].lower() not in args.native_types]
+            native_files = [f for f in native_files if os.path.splitext(f)[1].lower() in args.native_types]
+            if skipped:
+                print(f"  Filtered by --native-types {' '.join(sorted(args.native_types))}:")
+                print(f"    Skipped {len(skipped)}: {', '.join(sorted(skipped))}")
+        all_files.extend(native_files)
+        print(f"Found {len(native_files)} native executables")
+        if native_files:
+            if args.verbose:
+                print(f"  Native files: {', '.join(sorted(native_files))}")
+                # Extra debug: check each native file extension
+                for nf in sorted(native_files):
+                    ext = os.path.splitext(nf)[1].lower()
+                    print(f"    - {nf} (ext: '{ext}')")
+        else:
+            # Debug: Let's see what files were skipped
+            if args.verbose:
+                print("  No native executables found. Checking what was skipped...")
+                for f in os.listdir('.'):
+                    if not f.endswith('.lnk') and os.path.isfile(f):
+                        ext = os.path.splitext(f)[1].lower()
+                        is_exec = ext in EXECUTABLE_EXTENSIONS
+                        print(f"    - {f} (ext: '{ext}', is_executable: {is_exec})")
+    else:
+        if args.verbose:
+            print("\nNative files DISABLED (--no-native flag used)")
+            # Show what native files would have been processed
+            native_files = [f for f in os.listdir('.') if is_native_executable(f)]
+            if native_files:
+                print(f"  Skipping {len(native_files)} native files: {', '.join(sorted(native_files))}")
+    
+    if not all_files:
+        print("\nNo startup files found")
         print("\nTo use this script:")
         print("1. Create a 'Desktop-Startup' folder in your desired location")
-        print("2. Place .lnk shortcuts in that folder")
+        print("2. Place .lnk shortcuts and/or executable files in that folder")
         print("3. Set the shortcut's 'Start in' to the parent folder")
         print("   OR pass the path as an argument")
         return
     
-    print(f"\nFound {len(shortcuts)} shortcuts to process")
+    print(f"\nTotal files to process: {len(all_files)}")
     
-    # Group shortcuts by their target to detect intentional duplicates
-    shortcut_targets = {}
-    if shell:
-        for shortcut in shortcuts:
-            try:
-                obj = shell.CreateShortCut(shortcut)
-                target = os.path.basename(obj.Targetpath.lower())
-                if target not in shortcut_targets:
-                    shortcut_targets[target] = []
-                shortcut_targets[target].append(shortcut)
-            except:
-                pass
+    # Group files by their target to detect intentional duplicates
+    file_targets = {}
+    unparseable_shortcuts = []
+    for file in all_files:
+        targetname, _, _ = get_target_info(file, args)
+        if targetname is None and file.endswith('.lnk'):
+            unparseable_shortcuts.append(file)
+            continue
+        elif targetname:
+            target = targetname.lower()
+            if target not in file_targets:
+                file_targets[target] = []
+            file_targets[target].append(file)
     
     # Report duplicate targets
-    for target, files in shortcut_targets.items():
+    for target, files in file_targets.items():
         if len(files) > 1:
-            print(f"Note: {len(files)} shortcuts for {target}: {', '.join(files)}")
+            print(f"Note: {len(files)} files for {target}: {', '.join(files)}")
+    
+    # Report unparseable shortcuts
+    if unparseable_shortcuts:
+        print(f"Warning: {len(unparseable_shortcuts)} shortcuts cannot be parsed: {', '.join(unparseable_shortcuts)}")
+        if not WIN32_AVAILABLE:
+            print("  Install pywin32 package to enable .lnk file parsing")
     
     print("-" * 50)
     
-    # Clear launched shortcuts at start of each run
+    # Clear launched files at start of each run
     launched_shortcuts.clear()
     
-    for filename in shortcuts:
+    for filename in all_files:
         basename = os.path.splitext(filename)[0]
-        print(f"\nProcessing: {basename}")
+        file_type = "native" if is_native_executable(filename) else "shortcut"
+        print(f"\nProcessing ({file_type}): {basename}")
         
-        if not IsShortcutAlreadyRunning(filename, args):
+        # For shortcuts, check if we can parse them
+        if filename.endswith('.lnk'):
+            targetname, _, _ = get_target_info(filename, args)
+            if targetname is None:
+                print(f"  ✗ Skipping: Cannot parse shortcut file")
+                if not WIN32_AVAILABLE:
+                    print(f"     Install pywin32 to enable .lnk file support")
+                continue
+        
+        if not IsFileAlreadyRunning(filename, args):
             print(f"  Launching: {basename}")
-            arguments = ['explorer.exe', filename]
             
-            try:
-                proc = subprocess.Popen(arguments, shell=False, stdin=None, 
-                                      stdout=None, stderr=None, close_fds=True)
-                
+            if launch_file(filename, args):
                 # Mark as launched
                 launched_shortcuts.add(filename.lower())
                 
                 # Wait for process to start
                 counter = 0
+                targetname, _, _ = get_target_info(filename, args)
+                
+                # Skip wait if we couldn't determine target
+                if targetname is None:
+                    print(f"  ! Cannot verify if {basename} started (unable to parse)")
+                    time.sleep(args.delay)
+                    continue
                 
                 while counter < args.wait_time:
                     counter += 1
                     time.sleep(1)
                     
                     # For multiple instance programs, just wait a bit
-                    if should_allow_multiple(filename, basename, args):
+                    if should_allow_multiple(filename, targetname, args):
                         print(f"  Waiting for {basename}... ({counter}/{args.wait_time})")
                         if counter >= 2:  # Shorter wait for known multi-instance programs
                             print(f"  ✓ {basename} launched (multi-instance program)")
                             break
                     else:
                         # Check if process started for single-instance programs
-                        if IsShortcutAlreadyRunning(filename, args):
+                        if IsFileAlreadyRunning(filename, args):
                             print(f"  ✓ {basename} started successfully")
                             break
                         print(f"  Waiting for {basename} to start... ({counter}/{args.wait_time})")
@@ -501,14 +779,11 @@ def main():
                     print(f"  ! {basename} launched but window not detected (may be starting slowly)")
                 
                 time.sleep(args.delay)  # Configurable pause between launches
-                
-            except Exception as e:
-                print(f"  ✗ Error launching {basename}: {e}")
         else:
             print(f"  → Skipping {basename} (already running)")
     
     print("\nDesktop initialization complete!")
-    print(f"Launched {len(launched_shortcuts)} new shortcuts")
+    print(f"Launched {len(launched_shortcuts)} new file(s)")
 
 if __name__ == "__main__":
     main()
